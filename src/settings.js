@@ -43,7 +43,7 @@ import {
 
 await initializePersistentStorage();
 
-const MIN_WIDTH = 400;
+const MIN_WIDTH = 200;
 const MIN_HEIGHT = 200;
 const COLLAPSED_HEIGHT = 56;
 const SPEED_RAIL_WINDOW_GUTTER = 74;
@@ -201,6 +201,7 @@ const ui = {
   settingsSections: document.querySelectorAll("[data-settings-section]"),
   updatesSection: document.querySelector('[data-settings-section="updates"]'),
   windowStatus: document.querySelector("#windowStatus"),
+  resetWindowSizeButton: document.querySelector("#resetWindowSizeButton"),
   updaterCurrentVersion: document.querySelector("#updaterCurrentVersion"),
   updaterAvailableVersion: document.querySelector("#updaterAvailableVersion"),
   updaterPublishedAt: document.querySelector("#updaterPublishedAt"),
@@ -2861,6 +2862,15 @@ async function applyWindowSettings() {
   }
 }
 
+function restoreDefaultWindowSize() {
+  state.window.width = defaultState.window.width;
+  state.window.height = defaultState.window.height;
+  state.window.preset = "top-center";
+  fillForm();
+  scheduleApply();
+  ui.windowStatus.textContent = t("settings.resetWindowSizeDone");
+}
+
 function scheduleApply() {
   updatePositioningAvailability();
   updateAppearanceAvailability();
@@ -3026,6 +3036,7 @@ async function bootSettingsPage() {
 
     checkForAppUpdates({ installIfAvailable: true }).catch(console.error);
   });
+  ui.resetWindowSizeButton?.addEventListener("click", restoreDefaultWindowSize);
   ui.soundInputDeviceSelect.addEventListener("change", () => {
     syncSoundInputPreview({ forceRestart: true }).catch(console.error);
   });

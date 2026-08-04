@@ -14,10 +14,20 @@
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title data-i18n="doc.teleprompterTitle">Flow Teleprompter</title>
+    <script src="assets/vendor/vosk.js"></script>
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body data-page="teleprompter">
+    <div class="window-resize-handle window-resize-n" data-resize-direction="North" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-ne" data-resize-direction="NorthEast" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-e" data-resize-direction="East" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-e-visible" data-resize-direction="East" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-se" data-resize-direction="SouthEast" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-s" data-resize-direction="South" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-sw" data-resize-direction="SouthWest" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-w" data-resize-direction="West" aria-hidden="true"></div>
+    <div class="window-resize-handle window-resize-nw" data-resize-direction="NorthWest" aria-hidden="true"></div>
     <aside class="teleprompter-speed-rail" id="speedRail" aria-label="Words per minute control">
       <div class="speed-rail-value" id="speedRailValue">120</div>
       <div class="speed-rail-unit" data-i18n="common.wpm">wpm</div>
@@ -35,7 +45,8 @@
         <button class="icon-button" id="speedUpButton" data-i18n-title="common.faster" data-i18n-aria-label="common.faster" title="Faster" aria-label="Faster"><i class="ph ph-plus" aria-hidden="true"></i></button>
         <button class="icon-button wide-button" id="generateButton" data-i18n-title="common.generatePrompt" data-i18n-aria-label="common.generatePrompt" title="Generate prompt" aria-label="Generate prompt" data-i18n="common.ai">AI</button>
         <button class="icon-button" id="playButton" data-i18n-title="common.play" data-i18n-aria-label="common.play" title="Play" aria-label="Play"><i class="ph ph-play" aria-hidden="true"></i></button>
-        <button class="icon-button" id="inputButton" data-i18n-title="common.openTextPage" data-i18n-aria-label="common.openTextPage" title="Open text page" aria-label="Open text page"><i class="ph ph-note-pencil" aria-hidden="true"></i></button>
+        <button class="icon-button hidden" id="restartButton" data-i18n-title="common.replayStart" data-i18n-aria-label="common.replayStart" title="Replay from start" aria-label="Replay from start"><i class="ph ph-arrow-counter-clockwise" aria-hidden="true"></i></button>
+        <button class="icon-button wide-button script-entry-button" id="inputButton" data-i18n-title="common.openTextPage" data-i18n-aria-label="common.openTextPage" title="Open text page" aria-label="Open text page"><i class="ph ph-note-pencil" aria-hidden="true"></i><span data-i18n="common.addScript">添加稿件</span></button>
         <button class="icon-button" id="settingsButton" data-i18n-title="common.openSettings" data-i18n-aria-label="common.openSettings" title="Open settings" aria-label="Open settings"><i class="ph ph-gear-six" aria-hidden="true"></i></button>
         <button class="icon-button" id="closeAppButton" data-i18n-title="common.closeApp" data-i18n-aria-label="common.closeApp" title="Close app" aria-label="Close app"><i class="ph ph-x" aria-hidden="true"></i></button>
       </div>
@@ -53,6 +64,10 @@
         </div>
         <div class="playback-countdown" id="playbackCountdown" aria-hidden="true">
           <span class="playback-countdown-label" id="playbackCountdownLabel">3</span>
+        </div>
+        <div class="voice-diagnostics hidden" id="voiceDiagnostics" role="status" aria-live="polite">
+          <span class="voice-diagnostics-dot" aria-hidden="true"></span>
+          <span id="voiceDiagnosticsText">正在启动麦克风…</span>
         </div>
 
         <div class="drag-overlay hidden" id="dragOverlay">

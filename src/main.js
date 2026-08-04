@@ -11,6 +11,7 @@
 import { REALTIME_RELAY_URL, REMOTE_RELAY_URL } from "./remote-config.js";
 import { createRealtimeHostController } from "./realtime-host.js";
 import { clearRealtimeEditingConfig, clearStaleRealtimeEditingConfig, getRealtimeEditingUpdatedEventName } from "./realtime-editing.js";
+import { findApproximateTokenMatch, passesVoiceConfidence, splitTrackingTokens } from "./tracking-text.js";
 import {
   applyAppearanceToDocument,
   applyTextDirection,
@@ -51,7 +52,7 @@ function setButtonIcon(element, iconClassName) {
 
 
 // Configuration constants
-const MIN_WIDTH = 400;
+const MIN_WIDTH = 200;
 const MIN_HEIGHT = 200;
 const COLLAPSED_HEIGHT = 56;
 const COLLAPSE_DURATION = 420;
@@ -77,11 +78,12 @@ const MAX_WINDOW_POSITION_RETRIES = 3;
 const VOICE_WORD_VIEWPORT_OFFSET = 0.42;
 const VOICE_LINE_VIEWPORT_OFFSET = 0.38;
 const VOICE_SCROLL_EASING = 0.18;
-const VOICE_SCROLL_MAX_STEP = 18;
+const VOICE_SCROLL_MAX_STEP = 30;
 const VOICE_TRACKING_PARTIAL_MIN_INTERVAL_MS = 45;
 const VOICE_TRACKING_PARTIAL_REPEAT_GUARD_MS = 90;
-const VOICE_TRACKING_ADVANCE_STEP_MS = 28;
-const VOICE_TRACKING_MAX_ANIMATED_JUMP = 8;
+const VOICE_TRACKING_ADVANCE_STEP_MS = 16;
+const VOICE_TRACKING_MAX_ANIMATED_JUMP = 4;
+const CHINESE_VOICE_READ_AHEAD_WORDS = 2;
 const VOICE_TRACKING_MATCH_RADIUS = 2;
 const VOICE_FORWARD_SKIP_CONFIRM_MS = 2500;
 const VOICE_COMMAND_SOUND_URL = new URL("./assets/voice-command-recognized.mp3", import.meta.url).href;
@@ -160,6 +162,7 @@ const VOICE_CAPTURE_ERROR_UNAVAILABLE = "voice-capture-unavailable";
 const ui = {};
 let tickTimer = null;
 let voiceRecognition = null;
+let isVoiceTrackingAcceptingTranscript = false;
 let voiceCommandRecognition = null;
 let scrollAnimationFrame = null;
 let viewportScrollAnimationFrame = null;
@@ -238,6 +241,17 @@ let pendingForwardVoiceSkip = null;
 let voiceTrackingAdvanceFrame = null;
 let voiceTrackingAdvanceTarget = -1;
 let voiceTrackingAdvanceLastStepAt = 0;
+let manualVoiceAnchorStatusTimer = 0;
+let voiceDiagnosticsTimer = null;
+let voiceDiagnosticsPinnedError = false;
+let voiceStartupErrorAlertShown = false;
+let browserVoiceDebugState = {
+  audioLevel: 0,
+  processedSamples: 0,
+  lastText: "",
+  lastConfidence: null,
+  error: null
+};
 let voiceCommandListenerSession = 0;
 let voiceCommandResumeListenersInstalled = false;
 let voiceCommandSyncPromise = Promise.resolve();
@@ -678,6 +692,127 @@ function getVoiceModelStatusCacheKey(languageTag = getVoiceLanguageTag(), modelI
   return normalizedModelId ? `${normalizedLanguage}::${normalizedModelId}` : normalizedLanguage;
 }
 
+function showVoiceDiagnostics(key, params = {}, stateName = "active") {
+  if (!ui.voiceDiagnostics || !ui.voiceDiagnosticsText) {
+    return;
+  }
+
+  ui.voiceDiagnosticsText.textContent = t(key, params);
+  ui.voiceDiagnostics.dataset.state = stateName;
+  ui.voiceDiagnostics.classList.remove("hidden");
+  if (stateName === "error") {
+    voiceDiagnosticsPinnedError = true;
+  }
+}
+
+function hideVoiceDiagnostics(force = false) {
+  if (voiceDiagnosticsPinnedError && !force) {
+    return;
+  }
+  if (voiceDiagnosticsTimer) {
+    clearTimeout(voiceDiagnosticsTimer);
+    voiceDiagnosticsTimer = null;
+  }
+  ui.voiceDiagnostics?.classList.add("hidden");
+}
+
+function showVoiceStartupFailure(error) {
+  const message = String(error?.message || error || "Unknown error");
+  const params = { error: message };
+  showVoiceDiagnostics("tele.voiceDiag.error", params, "error");
+  if (ui.statusLabel) {
+    ui.statusLabel.textContent = t("tele.voiceDiag.error", params);
+    ui.statusLabel.title = t("tele.voiceDiag.error", params);
+  }
+  if (!voiceStartupErrorAlertShown) {
+    voiceStartupErrorAlertShown = true;
+    window.setTimeout(() => window.alert(t("tele.voiceDiag.error", params)), 0);
+  }
+}
+
+function scheduleVoiceDiagnostics(delayMs = 650) {
+  if (voiceDiagnosticsTimer) {
+    clearTimeout(voiceDiagnosticsTimer);
+  }
+  voiceDiagnosticsTimer = window.setTimeout(() => {
+    voiceDiagnosticsTimer = null;
+    refreshVoiceDiagnostics().catch(console.error);
+  }, delayMs);
+}
+
+async function refreshVoiceDiagnostics() {
+  if (!isPlaying || getActiveMode() !== "voice") {
+    hideVoiceDiagnostics();
+    return;
+  }
+
+  if (!invoke) {
+    showVoiceDiagnostics("tele.voiceDiag.noCapture", {}, "error");
+    return;
+  }
+
+  if (isVoiceTrackingStarting && normalizeVoiceLanguage(getVoiceLanguageTag()) === "zh-CN" && !voiceRecognition) {
+    showVoiceDiagnostics("tele.voiceDiag.starting", {}, "silent");
+    scheduleVoiceDiagnostics();
+    return;
+  }
+
+  if (voiceRecognition?.engine === "vosk-browser") {
+    const level = (browserVoiceDebugState.audioLevel * 100).toFixed(2);
+    const samples = Number(browserVoiceDebugState.processedSamples || 0).toLocaleString();
+    const confidence = Number.isFinite(browserVoiceDebugState.lastConfidence)
+      ? browserVoiceDebugState.lastConfidence.toFixed(2)
+      : "—";
+    if (browserVoiceDebugState.error) {
+      showVoiceDiagnostics("tele.voiceDiag.error", { error: browserVoiceDebugState.error }, "error");
+    } else if (browserVoiceDebugState.lastText) {
+      showVoiceDiagnostics("tele.voiceDiag.recognized", {
+        text: browserVoiceDebugState.lastText,
+        level,
+        confidence
+      }, "active");
+    } else {
+      showVoiceDiagnostics("tele.voiceDiag.capture", {
+        device: getSoundInputSettings().deviceLabel || "default",
+        level,
+        samples
+      }, browserVoiceDebugState.audioLevel > 0.0001 ? "active" : "silent");
+    }
+    scheduleVoiceDiagnostics();
+    return;
+  }
+
+  try {
+    const engine = await invoke("get_voice_engine_debug_state");
+    const tracking = engine?.tracking || {};
+    const error = tracking.lastError;
+    const recognizedText = String(tracking.lastPartialText || tracking.lastFinalText || "").trim();
+    const audioLevel = Number(engine?.audioLevel) || 0;
+    const level = (audioLevel * 100).toFixed(2);
+    const samples = Number(engine?.processedSamples || 0).toLocaleString();
+    const device = engine?.capture?.deviceName || engine?.currentSettings?.deviceLabel || "default";
+    const rawConfidence = tracking.lastConfidence;
+    const numericConfidence = Number(rawConfidence);
+    const confidence = rawConfidence !== null && rawConfidence !== undefined && Number.isFinite(numericConfidence)
+      ? numericConfidence.toFixed(2)
+      : "—";
+
+    if (error) {
+      showVoiceDiagnostics("tele.voiceDiag.error", { error }, "error");
+    } else if (recognizedText) {
+      showVoiceDiagnostics("tele.voiceDiag.recognized", { text: recognizedText, level, confidence }, "active");
+    } else if (engine?.captureActive && engine?.trackingActive) {
+      showVoiceDiagnostics("tele.voiceDiag.capture", { device, level, samples }, audioLevel > 0.0001 ? "active" : "silent");
+    } else {
+      showVoiceDiagnostics("tele.voiceDiag.noCapture", {}, "error");
+    }
+  } catch (error) {
+    showVoiceDiagnostics("tele.voiceDiag.error", { error: String(error?.message || error) }, "error");
+  }
+
+  scheduleVoiceDiagnostics();
+}
+
 function handleNativeVoiceEvent(payload) {
   if (!payload?.channel || !payload?.stage) {
     return;
@@ -727,6 +862,7 @@ function handleNativeVoiceEvent(payload) {
   if (payload.channel === "tracking") {
     if (payload.stage === "started") {
       lastVoiceTrackingAudioProcessAt = performance.now();
+      scheduleVoiceDiagnostics(0);
       if (isPlaying && getActiveMode() === "voice" && ui.statusLabel) {
         ui.statusLabel.textContent = "🎤 Listening...";
       }
@@ -735,16 +871,18 @@ function handleNativeVoiceEvent(payload) {
 
     if (payload.stage === "partial") {
       lastVoiceTrackingAudioProcessAt = performance.now();
-      if (applyVoiceTrackingWordHints(payload.words, { confidence: payload.confidence ?? 0 })) {
+      scheduleVoiceDiagnostics(0);
+      if (applyVoiceTrackingWordHints(payload.words, { confidence: payload.confidence })) {
         return;
       }
-      applyVoiceTrackingTranscript(payload.text, { isFinal: false, confidence: payload.confidence ?? 0 });
+      applyVoiceTrackingTranscript(payload.text, { isFinal: false, confidence: payload.confidence });
       return;
     }
 
     if (payload.stage === "final") {
       lastVoiceTrackingAudioProcessAt = performance.now();
-      applyVoiceTrackingTranscript(payload.text, { isFinal: true, confidence: payload.confidence ?? 0 });
+      scheduleVoiceDiagnostics(0);
+      applyVoiceTrackingTranscript(payload.text, { isFinal: true, confidence: payload.confidence });
       return;
     }
 
@@ -758,6 +896,7 @@ function handleNativeVoiceEvent(payload) {
       }
       if (!isPlaying || getActiveMode() !== "voice") {
         activeVoiceTrackingLanguageTag = null;
+        hideVoiceDiagnostics();
       }
       return;
     }
@@ -774,6 +913,7 @@ function handleNativeVoiceEvent(payload) {
           ui.statusLabel.textContent = getVoiceTrackingFailureStatus(trackingError);
         }
         stopPlayback();
+        showVoiceStartupFailure(payload.error || "Unknown error");
       } else if (voiceRecognition?.engine === "native") {
         voiceRecognition = null;
         activeVoiceTrackingLanguageTag = null;
@@ -801,7 +941,8 @@ function buildVoiceCaptureAudioConstraints(soundInputSettings = getSoundInputSet
     echoCancellation: true,
     noiseSuppression: true,
     autoGainControl: false,
-    channelCount: 1
+    channelCount: 1,
+    sampleRate: { ideal: 16_000 }
   };
 
   if (soundInputSettings.deviceId !== defaultState.appearance.soundInputDeviceId) {
@@ -1163,6 +1304,8 @@ function cacheUi() {
   ui.promptText = document.querySelector("#promptText");
   ui.playbackCountdown = document.querySelector("#playbackCountdown");
   ui.playbackCountdownLabel = document.querySelector("#playbackCountdownLabel");
+  ui.voiceDiagnostics = document.querySelector("#voiceDiagnostics");
+  ui.voiceDiagnosticsText = document.querySelector("#voiceDiagnosticsText");
   ui.progressLabel = document.querySelector("#progressLabel");
   ui.statusLabel = document.querySelector("#statusLabel");
   ui.footerMeta = document.querySelector("#footerMeta");
@@ -1171,6 +1314,7 @@ function cacheUi() {
   ui.speedUpButton = document.querySelector("#speedUpButton");
   ui.generateButton = document.querySelector("#generateButton");
   ui.playButton = document.querySelector("#playButton");
+  ui.restartButton = document.querySelector("#restartButton");
   ui.floatingControls = document.querySelector("#floatingControls");
   ui.floatingReplayButton = document.querySelector("#floatingReplayButton");
   ui.floatingPauseButton = document.querySelector("#floatingPauseButton");
@@ -1180,6 +1324,7 @@ function cacheUi() {
   ui.inputButton = document.querySelector("#inputButton");
   ui.settingsButton = document.querySelector("#settingsButton");
   ui.closeAppButton = document.querySelector("#closeAppButton");
+  ui.resizeHandles = document.querySelectorAll("[data-resize-direction]");
   ui.collapseButton = document.querySelector("#collapseButton");
   ui.pinButton = document.querySelector("#pinButton");
   ui.dragOverlay = document.querySelector("#dragOverlay");
@@ -2231,8 +2376,14 @@ function getPlaybackViewportOffset(defaultOffset, voiceOffset) {
 function updatePlayButtons() {
   const isResume = currentIndex > 0 && currentIndex < Math.max(wordNodes.length - 1, 0);
   setButtonIcon(ui.playButton, "ph-play");
-  ui.playButton.title = isResume ? t("common.startFresh") : t("common.play");
+  ui.playButton.title = isResume ? t("common.continue") : t("common.play");
   ui.playButton.setAttribute("aria-label", ui.playButton.title);
+
+  if (ui.restartButton) {
+    ui.restartButton.title = t("common.replayStart");
+    ui.restartButton.setAttribute("aria-label", ui.restartButton.title);
+    ui.restartButton.classList.toggle("hidden", !isResume || isPlaying);
+  }
 
   const pauseLabel = isPaused ? t("common.continue") : t("common.pause");
   setButtonIcon(ui.floatingPauseButton, isPaused ? "ph-play-circle" : "ph-pause-circle");
@@ -2269,6 +2420,7 @@ function applyAppearanceSettings() {
   const appearance = state.appearance || defaultState.appearance;
   applyAppearanceToDocument(appearance);
   document.body.dataset.animationStyle = getAnimationStyle();
+  document.body.dataset.activeMode = getActiveMode();
   document.documentElement.style.setProperty("--teleprompter-font-family", resolveFontStack(appearance.fontFamily, state.language));
   document.documentElement.style.setProperty("--teleprompter-text-rgb", hexToRgbTriplet(appearance.textColor));
   document.documentElement.style.setProperty("--teleprompter-active-text", appearance.textColor);
@@ -2841,8 +2993,15 @@ function findPreservedWordIndex(previousScript, nextScript, previousIndex) {
   }
 
   const fallbackIndex = clamp(previousIndex, 0, nextWords.length - 1);
-  if (!previousScript || nextScript.startsWith(previousScript)) {
+  if (previousScript === nextScript || (previousScript && nextScript.startsWith(previousScript))) {
     return fallbackIndex;
+  }
+
+  // A completely new pasted/imported script must start at the beginning.
+  // Reusing the old numeric index here made a new 758-character script appear
+  // to start at e.g. character 162 when the prior script stopped there.
+  if (!previousScript) {
+    return 0;
   }
 
   const previousWords = splitWords(previousScript);
@@ -2873,7 +3032,7 @@ function findPreservedWordIndex(previousScript, nextScript, previousIndex) {
     }
   }
 
-  return fallbackIndex;
+  return 0;
 }
 
 function captureScrollViewportAnchor(viewportTop) {
@@ -4265,6 +4424,10 @@ async function getVoiceModelSourceUrl(languageTag = getVoiceLanguageTag(), optio
   const { preferBundledEnglish = false } = options;
   const modelId = options.modelId ?? getSelectedVoiceModelId(normalizedLanguage);
 
+  if (normalizedLanguage === "zh-CN" && modelId === "vosk-model-small-cn-0.22" && invoke && convertFileSrc) {
+    return "ipc:portable-small-cn";
+  }
+
   if (preferBundledEnglish && normalizedLanguage === ENGLISH_VOICE_LANGUAGE) {
     return VOSK_COMMAND_MODEL_URL;
   }
@@ -4310,7 +4473,33 @@ async function ensureOfflineVoiceCommandModel(languageTag = getVoiceLanguageTag(
     return null;
   }
 
-  const modelPromise = window.Vosk.createModel(modelUrl, -1)
+  const modelPromise = (async () => {
+    let workerModelUrl = modelUrl;
+    let objectUrl = null;
+    try {
+      if (normalizedLanguage === "zh-CN") {
+        const rawBytes = await invoke("read_portable_browser_chinese_model");
+        const modelBytes = rawBytes instanceof Uint8Array
+          ? rawBytes
+          : new Uint8Array(rawBytes);
+        const modelBlob = new Blob([modelBytes], { type: "application/gzip" });
+        objectUrl = URL.createObjectURL(modelBlob);
+        workerModelUrl = objectUrl;
+      }
+
+      const timeout = new Promise((_, reject) => {
+        window.setTimeout(() => reject(new Error("Timed out loading browser Vosk model")), 60_000);
+      });
+      return await Promise.race([
+        window.Vosk.createModel(workerModelUrl, -1),
+        timeout
+      ]);
+    } finally {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    }
+  })()
     .then((model) => {
       voiceModels.set(cacheKey, model);
       voiceModelPromises.delete(cacheKey);
@@ -5307,7 +5496,7 @@ function normalizeText(text, locale = getVoiceLanguageTag()) {
 
 function tokenizeNormalizedText(text, locale = getVoiceLanguageTag()) {
   const normalized = normalizeText(text, locale);
-  return normalized ? normalized.split(" ") : [];
+  return normalized ? splitTrackingTokens(normalized) : [];
 }
 
 function getNormalizedTokenIndexForWord(wordIndex, edge = "end") {
@@ -5664,6 +5853,34 @@ function findVoiceLineMatch(spokenTokens, options = {}) {
     }
   }
 
+  if (/^zh\b/i.test(getVoiceLanguageTag())) {
+    const firstRange = getNormalizedTokenRangeForLine(candidateLineIndices[0]);
+    const lastRange = getNormalizedTokenRangeForLine(candidateLineIndices[candidateLineIndices.length - 1]);
+    if (firstRange && lastRange) {
+      const approximateMatch = findApproximateTokenMatch(normalizedWordTokens, spokenTokens, {
+        searchStart: firstRange.start,
+        searchEnd: lastRange.end,
+        expectedIndex: getNormalizedTokenIndexForWord(currentIndex, "end"),
+        minSpokenTokens: 4,
+        maxSpokenTokens: 12,
+        maxErrorRate: 0.34
+      });
+
+      if (approximateMatch) {
+        const matchedWordIndex = getWordIndexForNormalizedToken(approximateMatch.endIndex);
+        if (matchedWordIndex >= 0) {
+          return {
+            matchedIndex: approximateMatch.endIndex,
+            matchedWordIndex,
+            lineIndex: lineIndexByWord[matchedWordIndex] ?? lineWindow.activeLineIndex,
+            phraseLength: approximateMatch.spokenLength,
+            approximate: true
+          };
+        }
+      }
+    }
+  }
+
   const partialMatches = [];
 
   for (const lineIndex of candidateLineIndices) {
@@ -5803,13 +6020,25 @@ function scheduleVoiceTrackingAdvance(targetIndex, options = {}) {
 }
 
 function applyVoiceTrackingMatch(match, options = {}) {
-  const bestMatchIndex = match?.matchedWordIndex ?? -1;
-  if (bestMatchIndex < 0 || bestMatchIndex === currentIndex) {
+  const matchedWordIndex = match?.matchedWordIndex ?? -1;
+  if (matchedWordIndex < 0) {
     return false;
   }
 
-  if (bestMatchIndex < currentIndex) {
+  if (matchedWordIndex < currentIndex) {
     return true;
+  }
+
+  // Partial Chinese ASR naturally trails the speaker by a few characters.
+  // Keep the prompt slightly ahead for easier reading, but never predict the
+  // final node (which would end playback before the final word is spoken).
+  const shouldReadAhead = !options.immediate && /^zh\b/i.test(getVoiceLanguageTag());
+  const lastSafeReadAheadIndex = Math.max(wordNodes.length - 2, 0);
+  const bestMatchIndex = shouldReadAhead
+    ? Math.min(matchedWordIndex + CHINESE_VOICE_READ_AHEAD_WORDS, lastSafeReadAheadIndex)
+    : matchedWordIndex;
+  if (bestMatchIndex === currentIndex) {
+    return false;
   }
 
   const waitCard = getDuePromptWaitCardForVoiceIndex(bestMatchIndex);
@@ -5834,8 +6063,8 @@ function applyVoiceTrackingMatch(match, options = {}) {
 }
 
 function applyVoiceTrackingWordHints(words, options = {}) {
-  const { confidence = 0 } = options;
-  if (!Array.isArray(words) || !words.length || Number(confidence) < getVoiceTrackingConfidenceThreshold()) {
+  const { confidence = null } = options;
+  if (!Array.isArray(words) || !words.length || !passesVoiceConfidence(confidence, getVoiceTrackingConfidenceThreshold())) {
     return false;
   }
 
@@ -5983,6 +6212,8 @@ async function disposeVoiceTrackingAudioContext() {
 }
 
 async function stopVoiceTracking() {
+  hideVoiceDiagnostics();
+  isVoiceTrackingAcceptingTranscript = false;
   voiceTrackingSession += 1;
   isVoiceTrackingStarting = false;
   voiceTrackingStartPromise = null;
@@ -6034,7 +6265,7 @@ async function stopVoiceTracking() {
 
 function applyVoiceTrackingTranscript(transcript, options = {}) {
   const text = String(transcript || "").trim();
-  if (!text || !isPlaying || getActiveMode() !== "voice") {
+  if (!text || !isPlaying || !isVoiceTrackingAcceptingTranscript || getActiveMode() !== "voice") {
     return;
   }
 
@@ -6050,7 +6281,7 @@ function applyVoiceTrackingTranscript(transcript, options = {}) {
     return;
   }
 
-  if (Number(confidence) < getVoiceTrackingConfidenceThreshold()) {
+  if (!passesVoiceConfidence(confidence, getVoiceTrackingConfidenceThreshold())) {
     return;
   }
 
@@ -6095,12 +6326,137 @@ function applyVoiceTrackingTranscript(transcript, options = {}) {
   applyVoiceTrackingMatch(bestLineMatch, { immediate: isFinal });
 }
 
+async function startBrowserVoskTracking(languageTag, session) {
+  if (!window.Vosk?.createModel) {
+    throw new Error("Local vosk-browser module is unavailable");
+  }
+
+  if (isVoiceCommandRecognizerActive() || isVoiceCommandRecognitionStarting) {
+    await stopVoiceCommandListener();
+  }
+
+  const soundInput = getSoundInputSettings();
+  const model = await ensureOfflineVoiceCommandModel(languageTag);
+  if (!model) {
+    throw new Error(`Missing browser Vosk model for ${languageTag}`);
+  }
+
+  let mediaStream = null;
+  let audioContext = null;
+  let recognizer = null;
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: buildVoiceCaptureAudioConstraints(soundInput),
+      video: false
+    });
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+      throw new Error("WebView microphone audio is unavailable");
+    }
+    try {
+      audioContext = new AudioContextCtor({ latencyHint: "interactive", sampleRate: 16_000 });
+    } catch (_) {
+      audioContext = new AudioContextCtor({ latencyHint: "interactive" });
+    }
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    const createRecognizer = () => {
+      const nextRecognizer = new model.KaldiRecognizer(audioContext.sampleRate);
+      nextRecognizer.setWords(true);
+      nextRecognizer.on("partialresult", (message) => {
+        const text = String(message?.result?.partial || "").trim();
+        if (text) {
+          browserVoiceDebugState.lastText = text;
+          browserVoiceDebugState.lastConfidence = null;
+        }
+        applyVoiceTrackingTranscript(text, { isFinal: false, confidence: null });
+      });
+      nextRecognizer.on("result", (message) => {
+        const text = getVoskResultText(message);
+        const words = getVoskResultWords(message);
+        const confidence = words.length ? getAverageVoskWordConfidence(words) : null;
+        if (text) {
+          browserVoiceDebugState.lastText = text;
+          browserVoiceDebugState.lastConfidence = confidence;
+        }
+        applyVoiceTrackingTranscript(text, { isFinal: true, confidence });
+      });
+      return nextRecognizer;
+    };
+
+    recognizer = createRecognizer();
+
+    const captureNodes = await createVoiceCaptureNode(
+      audioContext,
+      mediaStream,
+      (samples, sampleRate) => {
+        if (session !== voiceTrackingSession || !samples?.length) {
+          return;
+        }
+        let sumSquares = 0;
+        for (let index = 0; index < samples.length; index += 1) {
+          sumSquares += samples[index] * samples[index];
+        }
+        browserVoiceDebugState.audioLevel = Math.sqrt(sumSquares / samples.length);
+        browserVoiceDebugState.processedSamples += samples.length;
+        lastVoiceTrackingAudioProcessAt = performance.now();
+        try {
+          recognizer.acceptWaveformFloat(samples, sampleRate);
+        } catch (error) {
+          browserVoiceDebugState.error = String(error?.message || error);
+          console.error("vosk-browser audio processing failed", error);
+        }
+      },
+      { soundInputSettings: soundInput, preferScriptProcessor: true }
+    );
+
+    if (session !== voiceTrackingSession) {
+      recognizer.remove();
+      stopMediaStreamTracks(mediaStream);
+      await audioContext.close().catch(() => {});
+      return;
+    }
+
+    voiceTrackingMediaStream = mediaStream;
+    voiceTrackingAudioContext = audioContext;
+    voiceTrackingSourceNode = captureNodes.sourceNode;
+    voiceTrackingProcessorNode = captureNodes.processorNode;
+    voiceTrackingSilenceNode = captureNodes.silenceNode;
+    voiceRecognition = {
+      engine: "vosk-browser",
+      reset() {
+        recognizer.remove();
+        recognizer = createRecognizer();
+      },
+      remove() {
+        recognizer.remove();
+      }
+    };
+    activeVoiceTrackingLanguageTag = languageTag;
+    lastVoiceTrackingAudioProcessAt = performance.now();
+    voiceCommandSharedWithTracking = false;
+    updateVoiceCommandIndicator();
+    scheduleVoiceDiagnostics(0);
+  } catch (error) {
+    try {
+      recognizer?.remove?.();
+    } catch (_) {
+      // Recognizer was not fully initialized.
+    }
+    stopMediaStreamTracks(mediaStream);
+    await audioContext?.close?.().catch(() => {});
+    throw normalizeVoiceCaptureError(error);
+  }
+}
+
 async function startVoiceTracking() {
   if (!hasOfflineVoiceCommandSupport()) {
     throw new Error("Vosk voice recognition is not supported");
   }
 
-  if (voiceRecognition?.engine === "native") {
+  if (voiceRecognition) {
     return;
   }
 
@@ -6114,6 +6470,10 @@ async function startVoiceTracking() {
     syncStateFromStorage();
     const languageTag = getVoiceLanguageTag();
     rebuildNormalizedScriptTokenMap(languageTag);
+    if (normalizeVoiceLanguage(languageTag) === "zh-CN") {
+      await startBrowserVoskTracking(languageTag, session);
+      return;
+    }
     await ensureNativeVoiceEventListener();
     await invoke("start_voice_tracking", buildNativeVoicePayload(languageTag));
     if (session !== voiceTrackingSession) {
@@ -6147,16 +6507,37 @@ async function startVoiceTracking() {
   }
 }
 
-function playVoiceMode() {
+function prepareVoiceMode() {
   clearPromptFeedback();
+  isVoiceTrackingAcceptingTranscript = false;
+  voiceDiagnosticsPinnedError = false;
+  voiceStartupErrorAlertShown = false;
+  browserVoiceDebugState = {
+    audioLevel: 0,
+    processedSamples: 0,
+    lastText: "",
+    lastConfidence: null,
+    error: null
+  };
+  showVoiceDiagnostics("tele.voiceDiag.starting", {}, "silent");
+  scheduleVoiceDiagnostics(250);
   scheduleVoiceHealthCheck(0);
   voiceTranscript = "";
   resetVoiceCommandTranscript();
   syncPromptLayout();
+
+  return startVoiceTracking();
+}
+
+function activateVoiceMode() {
+  isVoiceTrackingAcceptingTranscript = true;
   updateWordState(true);
   if (ui.statusLabel) ui.statusLabel.textContent = "\u{1F3A4} Listening...";
+  scheduleVoiceDiagnostics(0);
+  scheduleVoiceHealthCheck(0);
+}
 
-  startVoiceTracking().catch((error) => {
+function handleVoiceModeStartupFailure(error) {
     console.error("Vosk voice tracking failed to start", error);
     const feedbackKey = getVoiceTrackingFeedbackKey(error);
     if (feedbackKey) {
@@ -6166,6 +6547,33 @@ function playVoiceMode() {
       ui.statusLabel.textContent = getVoiceTrackingFailureStatus(error);
     }
     stopPlayback();
+    showVoiceStartupFailure(error);
+}
+
+function playVoiceMode() {
+  prepareVoiceMode()
+    .then(() => {
+      if (isPlaying && !isPaused && getActiveMode() === "voice") {
+        activateVoiceMode();
+      }
+    })
+    .catch(handleVoiceModeStartupFailure);
+}
+
+function preloadSelectedVoiceModel() {
+  if (getActiveMode() !== "voice") {
+    return;
+  }
+
+  const languageTag = getVoiceLanguageTag();
+  if (normalizeVoiceLanguage(languageTag) !== "zh-CN") {
+    return;
+  }
+
+  // Loading the archive/WASM is safe to do at boot and does not request the
+  // microphone. Actual audio capture still begins only after the user starts.
+  ensureOfflineVoiceCommandModel(languageTag).catch((error) => {
+    console.error("Chinese voice model preload failed", error);
   });
 }
 
@@ -6188,6 +6596,16 @@ async function play() {
   resetPromptWaitCards(activeMode === "scroll" ? getCachedPromptScrollableHeight() * scrollProgress : 0, currentIndex);
   lastStatusUpdateAt = 0;
   updatePlayButtons();
+
+  // Start microphone capture and the recognizer while 3-2-1 is visible. The
+  // transcript gate stays closed until the countdown completes, so countdown
+  // speech can warm Vosk without moving the prompt.
+  const voiceStartupResultPromise = activeMode === "voice"
+    ? prepareVoiceMode().then(
+      () => ({ ok: true }),
+      (error) => ({ ok: false, error })
+    )
+    : null;
 
   const countdownCompleted = await runPlaybackCountdown();
   if (!countdownCompleted) {
@@ -6213,7 +6631,15 @@ async function play() {
   }
 
   if (activeMode === "voice") {
-    playVoiceMode();
+    const voiceStartupResult = await voiceStartupResultPromise;
+    if (!voiceStartupResult?.ok) {
+      handleVoiceModeStartupFailure(voiceStartupResult?.error);
+      return;
+    }
+    if (!isPlaying || isPaused) {
+      return;
+    }
+    activateVoiceMode();
     syncVoiceCommandListener();
     return;
   }
@@ -6664,6 +7090,41 @@ function jumpToIndex(targetIndex) {
   updateWordState(true);
 }
 
+function reanchorVoiceTrackingAtIndex(targetIndex) {
+  if (wordNodes.length === 0) {
+    return;
+  }
+
+  stopVoiceTrackingAdvance();
+  clearPendingForwardVoiceSkip();
+  voiceTranscript = "";
+  lastVoiceTrackingPartialHandledAt = 0;
+  lastVoiceTrackingPartialKey = "";
+
+  try {
+    voiceRecognition?.reset?.();
+  } catch (error) {
+    console.error("Could not reset the voice recognizer after manual positioning", error);
+  }
+
+  currentIndex = clamp(targetIndex, 0, wordNodes.length - 1);
+  const totalScrollable = refreshPromptViewportMetrics();
+  const activeLineIndex = lineIndexByWord[currentIndex] ?? 0;
+  const targetTop = getLineTargetTop(activeLineIndex);
+  scrollProgress = totalScrollable > 0 ? clamp(targetTop / totalScrollable, 0, 1) : 0;
+  resetPromptWaitCards(targetTop, currentIndex);
+  updateWordState(true);
+
+  if (manualVoiceAnchorStatusTimer) {
+    clearTimeout(manualVoiceAnchorStatusTimer);
+  }
+  ui.statusLabel.textContent = t("tele.status.voiceReanchored", { position: currentIndex + 1 });
+  manualVoiceAnchorStatusTimer = window.setTimeout(() => {
+    manualVoiceAnchorStatusTimer = 0;
+    updatePlaybackIndicators(true);
+  }, 1800);
+}
+
 function handlePromptClick(event) {
   const word = event.target.closest(".prompt-word");
   if (!word) {
@@ -6671,12 +7132,17 @@ function handlePromptClick(event) {
   }
 
   const activeMode = getActiveMode();
-  if (activeMode !== "highlight" && activeMode !== "line") {
+  if (activeMode !== "highlight" && activeMode !== "line" && activeMode !== "voice") {
     return;
   }
 
   const wordIndex = Number(word.dataset.index);
   if (!Number.isFinite(wordIndex)) {
+    return;
+  }
+
+  if (activeMode === "voice") {
+    reanchorVoiceTrackingAtIndex(wordIndex);
     return;
   }
 
@@ -6888,6 +7354,15 @@ function refreshFromStorage() {
 }
 
 function wireEvents() {
+  ui.resizeHandles?.forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const directionName = handle.dataset.resizeDirection;
+      invoke?.("start_main_resize", { direction: directionName }).catch(console.error);
+    });
+  });
+
   ui.speedDownButton.addEventListener("click", () => {
     adjustSpeed(-10);
   });
@@ -6942,6 +7417,12 @@ function wireEvents() {
   ui.playButton.addEventListener("click", () => {
     if (isPlaying) return;
     play();
+    focusPlaybackSurface();
+  });
+
+  ui.restartButton?.addEventListener("click", () => {
+    if (isPlaying) return;
+    replayFromStart();
     focusPlaybackSurface();
   });
 
@@ -7159,6 +7640,8 @@ async function bootFlowApp() {
     updateSpeedInputMode();
 
     renderScript();
+
+    preloadSelectedVoiceModel();
 
     realtimeHostController = createRealtimeHostController({
       buildCloudApiUrl: buildRealtimeApiUrl,

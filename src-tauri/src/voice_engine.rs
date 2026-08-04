@@ -19,8 +19,7 @@ use std::{
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    BufferSize, Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedBufferSize,
-    SupportedStreamConfig,
+    BufferSize, Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -31,7 +30,6 @@ use crate::{ensure_voice_model_ready_for_model, normalize_voice_language};
 const NATIVE_VOICE_EVENT: &str = "flow-native-voice-event";
 const TARGET_SAMPLE_RATE: f32 = 16_000.0;
 const AUDIO_QUEUE_CAPACITY: usize = 6;
-const INPUT_BUFFER_TARGET_MS: u32 = 12;
 const RECOGNIZER_BATCH_SAMPLES: usize = 320;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
@@ -124,6 +122,8 @@ pub(crate) struct VoiceEngineDebugState {
     command_active: bool,
     current_settings: Option<VoiceInputSettings>,
     capture: Option<CaptureDebugInfo>,
+    audio_level: f32,
+    processed_samples: u64,
     tracking: Option<RecognizerDebugState>,
     commands: Option<RecognizerDebugState>,
     model_cache_languages: Vec<String>,
@@ -167,6 +167,8 @@ struct SharedVoiceState {
     app: AppHandle,
     tracking: Option<ActiveRecognizer>,
     commands: Option<ActiveRecognizer>,
+    audio_level: f32,
+    processed_samples: u64,
 }
 
 struct ActiveRecognizer {
@@ -283,7 +285,7 @@ pub(crate) fn list_input_devices() -> Result<Vec<VoiceInputDeviceInfo>, String> 
 
 impl VoiceEngine {
     fn build_debug_state(&self) -> VoiceEngineDebugState {
-        let (tracking, commands) = self
+        let (tracking, commands, audio_level, processed_samples) = self
             .shared
             .as_ref()
             .and_then(|shared| shared.lock().ok())
@@ -297,9 +299,11 @@ impl VoiceEngine {
                         .commands
                         .as_ref()
                         .map(|recognizer| recognizer.debug_state.clone()),
+                    shared.audio_level,
+                    shared.processed_samples,
                 )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, 0.0, 0));
 
         let mut model_cache_languages = self.model_cache.keys().cloned().collect::<Vec<_>>();
         model_cache_languages.sort();
@@ -310,6 +314,8 @@ impl VoiceEngine {
             command_active: commands.is_some(),
             current_settings: self.current_settings.clone(),
             capture: self.capture_debug.clone(),
+            audio_level,
+            processed_samples,
             tracking,
             commands,
             model_cache_languages,
@@ -378,6 +384,8 @@ impl VoiceEngine {
             app: app.clone(),
             tracking: None,
             commands: None,
+            audio_level: 0.0,
+            processed_samples: 0,
         }));
         let capture =
             build_capture_session(&device, &supported_config, settings.clone(), shared.clone())?;
@@ -623,25 +631,30 @@ fn build_active_recognizer(
 
 fn select_input_device(settings: &VoiceInputSettings) -> Result<Device, String> {
     let host = cpal::default_host();
+    let mut devices = host
+        .input_devices()
+        .map_err(|error| format!("Failed to enumerate microphones: {error}"))?
+        .collect::<Vec<_>>();
 
     if let Some(requested_label) = settings.normalized_device_label() {
-        let devices = host
-            .input_devices()
-            .map_err(|error| format!("Failed to enumerate microphones: {error}"))?;
-
-        for device in devices {
+        if let Some(index) = devices.iter().position(|device| {
             let name = device.name().unwrap_or_default();
             let normalized_name = normalized_device_match_key(&name);
-            if normalized_name == requested_label
+            normalized_name == requested_label
                 || normalized_name.contains(&requested_label)
                 || requested_label.contains(&normalized_name)
-            {
-                return Ok(device);
-            }
+        }) {
+            return Ok(devices.swap_remove(index));
         }
     }
 
-    host.default_input_device()
+    if let Some(device) = host.default_input_device() {
+        return Ok(device);
+    }
+
+    devices
+        .into_iter()
+        .next()
         .ok_or_else(|| "No microphone detected".to_string())
 }
 
@@ -655,6 +668,10 @@ fn normalized_device_match_key(value: &str) -> String {
 }
 
 fn select_input_config(device: &Device) -> Result<SupportedStreamConfig, String> {
+    if let Ok(default_config) = device.default_input_config() {
+        return Ok(default_config);
+    }
+
     let mut supported_configs = device
         .supported_input_configs()
         .map_err(|error| format!("Failed to enumerate microphone formats: {error}"))?
@@ -719,7 +736,7 @@ fn build_input_stream(
     let channels = config.channels() as usize;
     let input_sample_rate = config.sample_rate().0 as f32;
     let mut stream_config: StreamConfig = config.clone().into();
-    stream_config.buffer_size = select_input_buffer_size(config);
+    stream_config.buffer_size = BufferSize::Default;
     let error_shared = shared.clone();
     let error_callback = move |error| {
         if let Ok(shared) = error_shared.lock() {
@@ -785,19 +802,6 @@ fn build_input_stream(
     }
 }
 
-fn select_input_buffer_size(config: &SupportedStreamConfig) -> BufferSize {
-    let target_frames = ((config.sample_rate().0 as u64 * INPUT_BUFFER_TARGET_MS as u64) / 1000)
-        .max(128)
-        .min(u32::MAX as u64) as u32;
-
-    match config.buffer_size() {
-        SupportedBufferSize::Range { min, max } => {
-            BufferSize::Fixed(target_frames.clamp(*min, *max))
-        }
-        SupportedBufferSize::Unknown => BufferSize::Default,
-    }
-}
-
 fn forward_audio_chunk(
     audio_tx: &SyncSender<Vec<i16>>,
     samples: Vec<i16>,
@@ -832,6 +836,12 @@ fn process_audio_chunk(shared: &Arc<Mutex<SharedVoiceState>>, samples: &[i16]) {
     };
 
     let app = shared.app.clone();
+    let sum_squares = samples.iter().fold(0.0f64, |sum, sample| {
+        let normalized = *sample as f64 / i16::MAX as f64;
+        sum + normalized * normalized
+    });
+    shared.audio_level = (sum_squares / samples.len() as f64).sqrt() as f32;
+    shared.processed_samples = shared.processed_samples.saturating_add(samples.len() as u64);
 
     if let Some(tracking) = shared.tracking.as_mut() {
         feed_recognizer_in_batches(&app, "tracking", tracking, samples);

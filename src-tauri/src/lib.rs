@@ -49,6 +49,9 @@ mod voice_engine;
 use windows::core::{HSTRING, PCWSTR};
 
 #[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+#[cfg(windows)]
 use winreg::{
     enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
     RegKey,
@@ -61,7 +64,15 @@ use windows::Win32::System::Power::{
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, SetWindowDisplayAffinity, MB_ICONERROR, MB_OK, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    MessageBoxW, SendMessageW, SetWindowDisplayAffinity, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MB_ICONERROR, MB_OK, WM_NCLBUTTONDOWN,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+};
+
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, WPARAM},
+    UI::Input::KeyboardAndMouse::ReleaseCapture,
 };
 
 #[allow(dead_code)]
@@ -82,7 +93,7 @@ const VOICE_MODEL_REGISTRY_FILE_NAME: &str = "voice-model-registry.json";
 const SETTINGS_WINDOW_WIDTH: f64 = 620.0;
 const SETTINGS_WINDOW_HEIGHT: f64 = 700.0;
 const UPDATER_FEED_URL: &str =
-    "https://github.com/LumoRez07/Flow/releases/latest/download/latest.json";
+    "https://github.com/LumoRez07/Flow-CN/releases/latest/download/latest.json";
 const WEBVIEW2_CONSUMER_DOWNLOAD_URL: &str =
     "https://developer.microsoft.com/microsoft-edge/webview2/consumer/";
 #[cfg(windows)]
@@ -132,7 +143,7 @@ pub(crate) struct VoiceModelSpec {
     bundled_archive_kind: Option<BundledVoiceArchiveKind>,
 }
 
-const VOICE_MODEL_SPECS: [VoiceModelSpec; 23] = [
+const VOICE_MODEL_SPECS: [VoiceModelSpec; 25] = [
     VoiceModelSpec {
         model_id: "vosk-model-small-en-us-0.15",
         language: "en-US",
@@ -281,6 +292,36 @@ const VOICE_MODEL_SPECS: [VoiceModelSpec; 23] = [
         runtime_memory_mb: 13000,
         license: "Apache 2.0",
         description: "Previous-generation large English model.",
+        recommended: false,
+        bundled_archive_kind: None,
+    },
+    VoiceModelSpec {
+        model_id: "vosk-model-small-cn-0.22",
+        language: "zh-CN",
+        label: "中文（普通话）",
+        family: "Small",
+        archive_name: "vosk-model-small-cn-0.22.zip",
+        install_dir_name: "vosk-model-small-cn-0.22",
+        download_url: "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip",
+        download_size_mb: 42,
+        runtime_memory_mb: 300,
+        license: "Apache 2.0",
+        description: "适合桌面端实时跟读的轻量中文普通话模型。",
+        recommended: true,
+        bundled_archive_kind: None,
+    },
+    VoiceModelSpec {
+        model_id: "vosk-model-cn-0.22",
+        language: "zh-CN",
+        label: "中文（普通话）",
+        family: "Large",
+        archive_name: "vosk-model-cn-0.22.zip",
+        install_dir_name: "vosk-model-cn-0.22",
+        download_url: "https://alphacephei.com/vosk/models/vosk-model-cn-0.22.zip",
+        download_size_mb: 1336,
+        runtime_memory_mb: 16000,
+        license: "Apache 2.0",
+        description: "准确率更高但资源占用很大的通用中文普通话模型。",
         recommended: false,
         bundled_archive_kind: None,
     },
@@ -1322,7 +1363,7 @@ fn ensure_window(
         .decorations(false)
         .transparent(true)
         .shadow(false)
-        .resizable(false)
+        .resizable(label == "main")
         .skip_taskbar(true)
         .always_on_top(true)
         .center();
@@ -2331,6 +2372,7 @@ fn now_unix_ms() -> u64 {
 pub(crate) fn normalize_voice_language(language: &str) -> &'static str {
     match language.trim().to_ascii_lowercase().as_str() {
         "en" | "en-gb" | "en-us" => "en-US",
+        "zh" | "zh-cn" | "cn" | "cmn" | "cmn-cn" => "zh-CN",
         "tr" | "tr-tr" => "tr-TR",
         "ar" | "ar-sa" => "ar-SA",
         "de" | "de-de" => "de-DE",
@@ -2365,21 +2407,84 @@ pub(crate) fn get_voice_model_spec(
 }
 
 pub(crate) fn voice_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("voice-models");
+    let dir = app_storage_dir(app)?.join("voice-models");
 
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
 
+#[tauri::command]
+fn start_main_resize(window: WebviewWindow, direction: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // A frameless WebView2 window does not consistently expose its horizontal
+        // non-client resize border. Ask Windows to begin the standard resize drag.
+        let hit_test = match direction.as_str() {
+            "North" => HTTOP,
+            "NorthEast" => HTTOPRIGHT,
+            "East" => HTRIGHT,
+            "SouthEast" => HTBOTTOMRIGHT,
+            "South" => HTBOTTOM,
+            "SouthWest" => HTBOTTOMLEFT,
+            "West" => HTLEFT,
+            "NorthWest" => HTTOPLEFT,
+            _ => return Err("Unsupported resize direction".to_string()),
+        };
+        let handle = window
+            .window_handle()
+            .map_err(|error| format!("Could not access the main window: {error}"))?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err("The main window is not a Win32 window".to_string());
+        };
+        let hwnd = HWND(handle.hwnd.get() as *mut _);
+
+        unsafe {
+            ReleaseCapture().map_err(|error| format!("Could not prepare window resize: {error}"))?;
+            SendMessageW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(hit_test as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (window, direction);
+        Err("Window edge resizing is only available on Windows".to_string())
+    }
+}
+
+fn portable_storage_dir() -> Option<PathBuf> {
+    let executable_dir = env::current_exe().ok()?.parent()?.to_path_buf();
+    executable_dir
+        .join("Flow-CN-portable.flag")
+        .is_file()
+        .then(|| executable_dir.join("data"))
+}
+
+#[tauri::command]
+fn read_portable_browser_chinese_model() -> Result<tauri::ipc::Response, String> {
+    let path = portable_storage_dir()
+        .ok_or_else(|| "Portable data directory is unavailable".to_string())?
+        .join("voice-models")
+        .join("zh-CN")
+        .join("vosk-model-small-cn-0.22.tar.gz");
+    fs::read(&path)
+        .map(tauri::ipc::Response::new)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))
+}
+
 fn app_storage_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
+    let dir = match portable_storage_dir() {
+        Some(dir) => dir,
+        None => app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?,
+    };
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir)
 }
@@ -2697,6 +2802,7 @@ pub fn run() {
             set_clickthrough_shortcut_enabled,
             set_main_clickthrough,
             toggle_main_clickthrough,
+            start_main_resize,
             get_remote_receiver_status,
             configure_remote_receiver_access,
             remote_receiver_heartbeat,
@@ -2709,6 +2815,7 @@ pub fn run() {
             fetch_updater_feed_metadata,
             list_voice_models,
             get_voice_model_status,
+            read_portable_browser_chinese_model,
             download_voice_model,
             voice_engine::list_input_devices,
             voice_engine::start_voice_tracking,

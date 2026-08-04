@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "flow",
+  "productName": "Flow-CN",
   "version": "1.9.0",
-  "identifier": "lumorez",
+  "identifier": "com.flowcn.teleprompter",
   "build": {
     "frontendDist": "../src"
   },
@@ -11,13 +11,13 @@
     "windows": [
       {
         "url": "index.html",
-        "title": "Flow",
+        "title": "Flow-CN",
         "width": 550,
         "height": 260,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
-        "resizable": false,
+        "resizable": true,
         "shadow": false,
         "skipTaskbar": true,
         "center": false
@@ -36,7 +36,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": "all",
     "icon": [
       "icons/32x32.png",
@@ -49,7 +49,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMwODBEMDc2Mzk5NzkyQQpSV1FxZVpsakJ3MElBd2pFS0s2Zm0rd2prdnM5NW1XakJCcVJkcGpkeHdEdUNZbnhDbUpsd0pOTAo=",
       "endpoints": [
-        "https://github.com/LumoRez07/Flow/releases/latest/download/latest.json"
+        "https://github.com/LumoRez07/Flow-CN/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

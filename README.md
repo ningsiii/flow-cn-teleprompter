@@ -8,6 +8,32 @@
   (at your option) any later version.
 -->
 
+## Flow-CN Teleprompter（非官方中文分支）
+
+Flow-CN 是基于 [Flow](https://github.com/LumoRez07/Flow) 的 Windows 中文离线语音跟读提词器。
+
+本分支主要增加中文和中英混合稿件支持：
+
+- 本地 Vosk 中文语音识别；
+- 中文字符级跟读和稿件对齐；
+- 中文数字与阿拉伯数字兼容匹配；
+- 跟读卡住时点击文字手动重新定位并继续；
+- Windows 便携版窗口缩放支持。
+
+项目目前处于个人测试 beta 阶段，不代表 Flow 原作者的官方立场。
+
+本项目遵循原项目的 GPL-3.0-or-later 许可证。请阅读仓库中的 [LICENSE](LICENSE)，并保留原项目的版权和许可证声明。
+
+开发测试：
+
+```powershell
+npm.cmd install
+npm.cmd test
+npm.cmd run tauri dev
+```
+
+中文模型首次使用时下载并保存在本地；语音识别不需要云端服务。
+
 <div align="center">
 
 <p align="center">
