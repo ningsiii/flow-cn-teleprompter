@@ -1,0 +1,11 @@
+Third-party model notice
+
+The portable beta package includes:
+
+vosk-model-small-cn-0.22
+Copyright: Alpha Cephei / Vosk model contributors
+Source: https://alphacephei.com/vosk/models
+License: Apache License 2.0
+
+The Apache License 2.0 text is included in the release package as
+LICENSE-VOSK-MODEL-APACHE-2.0.txt.
